@@ -1,7 +1,7 @@
 from aiogram.fsm.state import State, StatesGroup
 
 class ExerciseStates(StatesGroup):
-    choosing_category = State()
+    waiting_for_category = State()
     viewing_exercise = State()
     searching = State()
 

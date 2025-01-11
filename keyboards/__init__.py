@@ -1,1 +1,1 @@
-from . import client_kb, admin_kb 
+from . import client_kb, admin_kb, schedule_kb 

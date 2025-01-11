@@ -1,1 +1,1 @@
-from . import admin, client, exercises 
+from . import admin, client, exercises, schedule 

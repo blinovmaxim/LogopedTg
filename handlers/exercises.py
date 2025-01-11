@@ -2,134 +2,152 @@ from aiogram import Router, F, types
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
+from datetime import datetime
 from keyboards.client_kb import get_main_keyboard
 from states.exercise_states import ExerciseStates
-from config import EXERCISE_CATEGORIES
+from config import EXERCISE_CATEGORIES, EXERCISE_SEARCH_QUERIES
 from utils.youtube import search_youtube_video
-from datetime import datetime, timedelta
-import json
-import os
 
 router = Router()
-CACHE_FILE = 'cache/youtube_cache.json'
-CACHE_DURATION = timedelta(hours=24)  # Кэш хранится 24 часа
 
-def load_cache():
-    if not os.path.exists('cache'):
-        os.makedirs('cache')
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, 'r', encoding='utf-8') as f:
-            cache = json.load(f)
-            # Проверяем срок действия кэша
-            if datetime.fromisoformat(cache['timestamp']) + CACHE_DURATION > datetime.now():
-                return cache['data']
-    return {}
-
-def save_cache(data):
-    cache = {
-        'timestamp': datetime.now().isoformat(),
-        'data': data
-    }
-    with open(CACHE_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cache, f, ensure_ascii=False)
-
+# Изменяем обработчик для кнопки "Мои упражнения"
 @router.message(F.text == "🎯 Мои упражнения")
 async def show_exercise_categories(message: Message):
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(
-            text=name,
-            callback_data=f"category_{code}"
-        )] for code, name in EXERCISE_CATEGORIES.items()
-    ])
+    keyboard = []
+    for code, name in EXERCISE_CATEGORIES.items():
+        keyboard.append([
+            types.InlineKeyboardButton(
+                text=f"➤ {name}",
+                callback_data=f"ex_{code}"
+            )
+        ])
     
+    markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
     await message.answer(
-        "Выберите категорию упражнений:",
-        reply_markup=keyboard
+        "<b>🎯 Видео-упражнения</b>\n\n"
+        "<i>Выберите категорию упражнений:</i>\n\n"
+        "• Каждая категория содержит специально подобранные видео\n"
+        "• Выполняйте упражнения регулярно\n"
+        "• Следите за техникой выполнения\n",
+        reply_markup=markup,
+        parse_mode="HTML"
     )
 
-@router.callback_query(lambda c: c.data.startswith('category_'))
-async def show_category_exercises(callback: CallbackQuery, state: FSMContext, force_update=False):
-    category_code = callback.data.replace('category_', '')
-    category_name = EXERCISE_CATEGORIES[category_code]
-    
-    # Всегда показываем сообщение о поиске
-    await callback.message.answer(f"🔍 Ищу упражнения для {category_name}...")
-    
-    # Принудительно ищем новые видео при обновлении
-    search_query = category_code  # Передаем код категории для точного поиска
-    videos = search_youtube_video(search_query)
-    
-    if not videos:
-        await callback.message.answer(f"К сожалению, не удалось найти упражнения для категории {category_name}")
-        await callback.answer()
-        return
+@router.callback_query(lambda c: c.data.startswith('ex_'))
+async def process_exercise_category(callback: CallbackQuery):
+    category_code = callback.data.replace('ex_', '')
+    if category_code in EXERCISE_CATEGORIES:
+        category_name = EXERCISE_CATEGORIES[category_code]
+        
+        videos = search_youtube_video(EXERCISE_SEARCH_QUERIES[category_code], max_results=5, force_update=True)
+        
+        if videos:
+            keyboard = []
+            for i, video in enumerate(videos, 1):
+                title = video['title']
+                if len(title) > 40:
+                    title = title[:37] + "..."
+                
+                keyboard.append([
+                    types.InlineKeyboardButton(
+                        text=f"📺 {title}",
+                        callback_data=f"video:{category_code}:{i-1}"
+                    )
+                ])
+            
+            # Добавляем кнопки обновления и возврата
+            keyboard.extend([
+                [
+                    types.InlineKeyboardButton(
+                        text="🔄 Обновить список",
+                        callback_data=f"refresh:{category_code}"
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="◀️ Вернуться к категориям",
+                        callback_data="back_to_categories"
+                    )
+                ]
+            ])
+            
+            markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+            
+            if not hasattr(callback.bot, 'videos'):
+                callback.bot.videos = {}
+            callback.bot.videos[category_code] = videos
+            
+            await callback.message.edit_text(
+                f"<b>🎯 {category_name}</b>\n\n"
+                f"<i>Выберите видео для просмотра:</i>\n",
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
 
-    # Создаем клавиатуру с найденными видео
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(
-            text=f"📺 {video['title'][:40]}...",
-            callback_data=f"video_{video['video_id']}"
-        )] for video in videos
-    ])
-    
-    # Добавляем кнопки управления
-    keyboard.inline_keyboard.extend([
-        [types.InlineKeyboardButton(
-            text="🔄 Обновить результаты",
-            callback_data=f"refresh_{category_code}"
-        )],
-        [types.InlineKeyboardButton(
-            text="↩️ Назад к категориям",
-            callback_data="back_to_categories"
-        )]
-    ])
-    
-    await callback.message.answer(
-        f"🎯 Найденные упражнения для {category_name}:\n"
-        f"Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
-        f"Выберите видео для просмотра:",
-        reply_markup=keyboard
-    )
-    await state.update_data(videos={v['video_id']: v for v in videos})
-    await callback.answer()
+@router.callback_query(lambda c: c.data.startswith('refresh:'))
+async def refresh_videos(callback: CallbackQuery):
+    try:
+        _, category_code = callback.data.split(':')
+        if category_code in EXERCISE_CATEGORIES:
+            # Показываем уведомление о начале обновления
+            await callback.answer("🔄 Обновляем список видео...")
+            
+            # Получаем новые видео с принудительным обновлением
+            videos = search_youtube_video(
+                EXERCISE_SEARCH_QUERIES[category_code], 
+                max_results=5, 
+                force_update=True
+            )
+            
+            if videos:
+                # Перенаправляем на показ обновленного списка
+                callback.data = f"ex_{category_code}"
+                await process_exercise_category(callback)
+            else:
+                await callback.answer("❌ Не удалось загрузить видео")
+    except Exception as e:
+        print(f"Ошибка при обновлении видео: {e}")
+        await callback.answer("❌ Ошибка обновления")
 
-@router.callback_query(lambda c: c.data.startswith('refresh_'))
-async def refresh_videos(callback: CallbackQuery, state: FSMContext):
-    category_code = callback.data.replace('refresh_', '')
-    await callback.message.answer("🔄 Обновляю список видео...")
-    await show_category_exercises(callback, state, force_update=True)
-
-@router.callback_query(lambda c: c.data.startswith('video_'))
-async def show_video(callback: CallbackQuery, state: FSMContext):
-    video_id = callback.data.replace('video_', '')
-    
-    # Получаем данные о видео
-    data = await state.get_data()
-    video = data['videos'].get(video_id)
-    
-    if not video:
-        await callback.message.answer("Видео не найдено")
-        return
-
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(
-            text="▶️ Смотреть на YouTube",
-            url=f"https://www.youtube.com/watch?v={video_id}"
-        )],
-        [types.InlineKeyboardButton(
-            text="↩️ Назад к списку",
-            callback_data=callback.message.reply_markup.inline_keyboard[-1][0].callback_data
-        )]
-    ])
-    
-    await callback.message.answer(
-        f"📺 {video['title']}\n\n"
-        f"Нажмите кнопку ниже, чтобы посмотреть видео на YouTube:",
-        reply_markup=keyboard
-    )
-    await callback.answer()
+@router.callback_query(lambda c: c.data.startswith('video:'))  # Изменили разделитель на :
+async def confirm_watch_video(callback: CallbackQuery):
+    try:
+        _, category_code, video_idx = callback.data.split(':')  # Используем : вместо _
+        video_idx = int(video_idx)
+        
+        videos = getattr(callback.bot, 'videos', {}).get(category_code, [])
+        
+        if videos and video_idx < len(videos):
+            video = videos[video_idx]
+            keyboard = [
+                [
+                    types.InlineKeyboardButton(
+                        text="▶️ Смотреть видео",
+                        url=video['url']
+                    )
+                ],
+                [
+                    types.InlineKeyboardButton(
+                        text="◀️ Назад к списку",
+                        callback_data=f"ex_{category_code}"
+                    )
+                ]
+            ]
+            
+            markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
+            
+            await callback.message.edit_text(
+                f"<b>📺 {video['title']}</b>\n\n"
+                "Нажмите <b>▶️ Смотреть видео</b>, чтобы начать просмотр\n\n"
+                "<i>💡 Совет: Выполняйте упражнение вместе с видео</i>",
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+    except Exception as e:
+        print(f"Ошибка при обработке callback: {e}")
+        await callback.answer("Произошла ошибка. Попробуйте еще раз.")
 
 @router.callback_query(lambda c: c.data == "back_to_categories")
 async def back_to_categories(callback: CallbackQuery):
     await show_exercise_categories(callback.message)
-    await callback.answer() 
+    await callback.answer()
