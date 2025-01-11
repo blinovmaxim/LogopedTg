@@ -7,14 +7,15 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKe
 from config import ADMIN_IDS
 from keyboards.admin_kb import get_admin_keyboard
 from keyboards.client_kb import get_main_keyboard
-from database import Database
+from database import db
 import json
 from datetime import datetime
 from aiogram.fsm.context import FSMContext
 from states.admin_states import AdminStates
+from aiogram.methods import GetChat
+from aiogram.fsm.state import StatesGroup, State
 
 router = Router()
-db = Database()
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -46,12 +47,23 @@ def get_restart_status() -> dict:
         return None
 # Добавляем в базу данных таблицу для ожидающих доступ
 async def init_db():
+    # Создаем таблицу для ожидающих доступ
     db.execute_query('''
     CREATE TABLE IF NOT EXISTS pending_users (
         user_id INTEGER PRIMARY KEY,
         username TEXT,
         full_name TEXT,
         request_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    ''')
+    
+    # Создаем таблицу для пользователей с доступом
+    db.execute_query('''
+    CREATE TABLE IF NOT EXISTS allowed_users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        granted_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     ''')
 
@@ -95,78 +107,57 @@ async def add_pending_user(bot: Bot, user_id: int, username: str = None, full_na
 
 # Добавляем обработчик для просмотра заявки
 @router.callback_query(lambda c: c.data.startswith('view_request_'))
-async def view_user_request(callback: CallbackQuery):
+async def view_request(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
+    
+    try:
+        user_id = int(callback.data.split('_')[2])
         
-    user_id = int(callback.data.split('_')[2])
-    
-    # Получаем информацию о пользователе
-    user_info = db.execute_query(
-        'SELECT user_id, username, full_name, request_time FROM pending_users WHERE user_id = ?',
-        (user_id,)
-    ).fetchone()
-    
-    if user_info:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="✅ Выдать доступ",
-                        callback_data=f"grant_{user_id}"
-                    ),
-                    InlineKeyboardButton(
-                        text="❌ Отклонить",
-                        callback_data=f"deny_{user_id}"
-                    )
-                ]
+        # Получаем информацию о пользователе
+        user = db.execute_query(
+            'SELECT user_id, username, full_name, request_time FROM pending_users WHERE user_id = ?',
+            (user_id,)
+        ).fetchone()
+        
+        if not user:
+            await callback.answer("❌ Заявка не найдена", show_alert=True)
+            return
+        
+        text = "👤 Заявка на доступ\n\n"
+        text += f"• ID: {user[0]}\n"
+        text += f"Username: @{user[1]}\n" if user[1] and user[1] != "Нет username" else "Username: не указан\n"
+        text += f"Имя: {user[2]}\n" if user[2] and user[2] != "Нет имени" else "Имя: не указано\n"
+        text += f"• Время запроса: {user[3]}"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Выдать доступ",
+                    callback_data=f"grant_{user_id}"
+                ),
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"deny_{user_id}"
+                )
             ]
-        )
+        ])
         
-        await callback.message.edit_text(
-            f"👤 <b>Заявка на доступ</b>\n\n"
-            f"• ID: <code>{user_info[0]}</code>\n"
-            f"• Username: @{user_info[1] or 'нет'}\n"
-            f"• Имя: {user_info[2] or 'не указано'}\n"
-            f"• Время запроса: {user_info[3]}\n\n"
-            f"ℹ️ Выберите действие:",
-            reply_markup=keyboard,
-            parse_mode="HTML"
-        )
-    else:
-        await callback.answer("❌ Заявка не найдена или уже обработана")
+        await callback.message.edit_text(text, reply_markup=keyboard)
+        
+    except Exception as e:
+        print(f"Ошибка при просмотре заявки: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)
 
 # Обработчик для админ-панели
 @router.message(lambda m: m.text == "⚙️ Админ-панель" and m.from_user.id in ADMIN_IDS)
 async def admin_panel(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
-    # Проверяем статус последнего перезапуска
-    restart_status = get_restart_status()
-    status_text = ""
-    
-    if restart_status:
-        if restart_status['status'] == 'success':
-            status_text = (
-                "\n\n✅ Статус бота: работает\n"
-                f"🕒 Последний перезапуск: {restart_status['timestamp']}"
-            )
-        elif restart_status['status'] == 'error':
-            status_text = (
-                "\n\n❌ Ошибка при последнем перезапуске\n"
-                f"🕒 Время: {restart_status['timestamp']}\n"
-                f"⚠️ Ошибка: {restart_status['error']}"
-            )
-        elif restart_status['status'] == 'stopped':
-            status_text = (
-                "\n\n⛔️ Бот был остановлен\n"
-                f"🕒 Время: {restart_status['timestamp']}\n"
-                f"📝 Причина: {restart_status['error']}"
-            )
-    
+        
     await message.answer(
-        f"🔧 Панель администратора{status_text}",
+        "⚙️ Панель администратора\n\n"
+        "Выберите нужный раздел:",
         reply_markup=get_admin_keyboard()
     )
 
@@ -284,15 +275,48 @@ async def list_access(message: Message):
     if not is_admin(message.from_user.id):
         return
     
-    users = db.get_allowed_users()
-    if users:
-        text = "📋 Пользователи с доступом:\n\n"
-        for user_id in users:
-            text += f"• {user_id}\n"
-    else:
-        text = "📋 Список пользователей с доступом пуст"
+    allowed_users = db.execute_query('''
+        SELECT user_id, username, full_name
+        FROM allowed_users 
+        WHERE user_id NOT IN ({})
+    '''.format(','.join(map(str, ADMIN_IDS)))).fetchall()
+
+    if not allowed_users:
+        await message.answer("📊 Список пользователей с доступом пуст")
+        return
+
+    text = "📊 Пользователи с доступом:\n\n"
+    keyboard = []
     
-    await message.answer(text)
+    for user in allowed_users:
+        user_id, username, full_name = user
+        # Делаем текст пользователя в одну строку и добавляем пробелы для ширины
+        user_info = f"ID: {user_id} | @{username} | {full_name}                    "
+        
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{user_info}❌ Отозвать",
+                callback_data=f"revoke_{user_id}"
+            )
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton(
+            text="🔄 Обновить список",
+            callback_data="refresh_allowed"
+        )
+    ])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await message.answer(text, reply_markup=markup)
+
+# Добавляем обработчик обновления списка
+@router.callback_query(lambda c: c.data == "refresh_list")
+async def refresh_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await list_access(callback.message)
+    await callback.answer("Список обновлен")
 
 # Добавляем справку по командам доступа
 @router.message(lambda m: m.text == '/access_help')
@@ -311,112 +335,159 @@ async def access_help(message: Message):
     await message.answer(help_text)
 
 # Обработчик кнопки "Ожидают доступ" в админ-панели
-@router.message(lambda m: m.text == "👥 Ожидают доступ" and m.from_user.id in ADMIN_IDS)
+@router.message(lambda m: m.text == "👥 Ожидают доступ")
 async def show_pending_users(message: Message):
     if not is_admin(message.from_user.id):
         return
         
     # Получаем список ожидающих
-    pending = db.execute_query(
+    pending_users = db.execute_query(
         'SELECT user_id, username, full_name, request_time FROM pending_users'
     ).fetchall()
     
-    if not pending:
-        await message.answer(
-            "📝 Нет пользователей, ожидающих доступ",
-            reply_markup=get_admin_keyboard()
+    text = "📊 Ожидают доступа:\n\n"
+    keyboard = []
+    
+    if pending_users:
+        for user_id, username, full_name, req_time in pending_users:
+            text += f"• ID: {user_id}\n"
+            text += f"Username: @{username}\n" if username and username != "Нет username" else "Username: не указан\n"
+            text += f"Имя: {full_name}\n" if full_name and full_name != "Нет имени" else "Имя: не указано\n"
+            text += f"Запрос: {req_time}\n\n"
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    text="✅ Выдать доступ",
+                    callback_data=f"grant_{user_id}"
+                )
+            ])
+    else:
+        text = "👥 Нет ожидающих доступа"
+    
+    keyboard.append([
+        InlineKeyboardButton(
+            text="🔄 Обновить список",
+            callback_data="refresh_pending"
         )
+    ])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await message.answer(text, reply_markup=markup)
+
+@router.message(lambda m: m.text == "✅ Пользователи с доступом" and m.from_user.id in ADMIN_IDS)
+async def show_allowed_users(message: Message):
+    if not is_admin(message.from_user.id):
         return
         
-    text = "📝 Пользователи, ожидающие доступ:\n\n"
-    for user in pending:
-        text += (
-            f"👤 ID: {user[0]}\n"
-            f"Username: @{user[1]}\n"
-            f"Имя: {user[2]}\n"
-            f"Запрос от: {user[3]}\n"
-            "➖➖➖➖➖➖➖➖➖\n"
-        )
-        
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Выдать доступ всем",
-                    callback_data="grant_all"
-                ),
-                InlineKeyboardButton(
-                    text="❌ Отклонить всех",
-                    callback_data="deny_all"
-                )
-            ]
-        ]
-    )
+    # Получаем пользователей с доступом
+    allowed_users = db.execute_query('''
+        SELECT user_id, username, full_name
+        FROM allowed_users 
+        WHERE user_id NOT IN ({})
+    '''.format(','.join(map(str, ADMIN_IDS)))).fetchall()
     
-    await message.answer(text, reply_markup=keyboard)
+    if not allowed_users:
+        text = "📊 Список пользователей с доступом пуст"
+        await message.answer(text)
+        return
+
+    text = "📊 Пользователи с доступом:"
+    keyboard = []
+    
+    for user in allowed_users:
+        user_id, username, full_name = user
+        # Форматируем информацию о пользователе в одну строку с отступами
+        user_text = f"ID: {user_id} | @{username} | {full_name}                              "
+        
+        # Добавляем одну кнопку на строку с информацией и кнопкой отзыва
+        keyboard.append([
+            InlineKeyboardButton(
+                text=user_text,
+                callback_data=f"info_{user_id}"
+            ),
+            InlineKeyboardButton(
+                text="❌",
+                callback_data=f"revoke_{user_id}"
+            )
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton(
+            text="🔄 Обновить список",
+            callback_data="refresh_allowed"
+        )
+    ])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await message.answer(text, reply_markup=markup)
 
 # Обработчики callback-кнопок
 @router.callback_query(lambda c: c.data.startswith(("grant_", "deny_")))
 async def process_access_action(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-        
-    action, user_id = callback.data.split('_')
-    bot = callback.bot
-    
-    if user_id == "all":
-        if action == "grant":
-            # Выдаем доступ всем ожидающим
-            pending = db.execute_query('SELECT user_id FROM pending_users').fetchall()
-            for user in pending:
-                db.add_allowed_user(user[0])
-                try:
-                    await bot.send_message(
-                        user[0],
-                        "✅ Администратор одобрил ваш доступ к боту!\n"
-                        "Теперь вы можете пользоваться всеми функциями."
-                    )
-                except:
-                    pass
-            db.execute_query('DELETE FROM pending_users')
-            await callback.message.edit_text("✅ Доступ выдан всем пользователям")
-        else:
-            # Отклоняем всех
-            pending = db.execute_query('SELECT user_id FROM pending_users').fetchall()
-            for user in pending:
-                try:
-                    await bot.send_message(
-                        user[0],
-                        "❌ К сожалению, ваш запрос на доступ отклонен."
-                    )
-                except:
-                    pass
-            db.execute_query('DELETE FROM pending_users')
-            await callback.message.edit_text("❌ Все запросы отклонены")
-    else:
+    try:
+        action, user_id = callback.data.split('_')
         user_id = int(user_id)
+        
+        bot = callback.bot
+        
         if action == "grant":
-            db.add_allowed_user(user_id)
+            # Получаем информацию о пользователе из pending_users
+            user_info = db.execute_query(
+                'SELECT username, full_name FROM pending_users WHERE user_id = ?',
+                (user_id,)
+            ).fetchone()
+            
+            if user_info:
+                username, full_name = user_info
+                # Добавляем пользователя в список разрешенных с сохранением username
+                db.execute_query(
+                    'INSERT OR REPLACE INTO allowed_users (user_id, username, full_name) VALUES (?, ?, ?)',
+                    (user_id, username, full_name)
+                )
+            else:
+                # Если нет в pending_users, получаем через API
+                chat_member = await bot.get_chat_member(user_id, user_id)
+                username = chat_member.user.username
+                full_name = chat_member.user.full_name
+                db.execute_query(
+                    'INSERT OR REPLACE INTO allowed_users (user_id, username, full_name) VALUES (?, ?, ?)',
+                    (user_id, username, full_name)
+                )
+            
             try:
                 await bot.send_message(
                     user_id,
                     "✅ Администратор одобрил ваш доступ к боту!\n"
                     "Теперь вы можете пользоваться всеми функциями."
                 )
-            except:
-                pass
-            db.execute_query('DELETE FROM pending_users WHERE user_id = ?', (user_id,))
-            await callback.message.edit_text(f"✅ Доступ выдан пользователю {user_id}")
-        else:
+                db.execute_query('DELETE FROM pending_users WHERE user_id = ?', (user_id,))
+                await callback.message.edit_text(f"✅ Доступ выдан пользователю {username or user_id}")
+                await callback.answer("✅ Доступ выдан", show_alert=True)
+                
+            except Exception as e:
+                print(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+                await callback.answer("❌ Ошибка отправки уведомления", show_alert=True)
+            
+        elif action == "deny":
             try:
+                # Отправляем уведомление об отказе
                 await bot.send_message(
                     user_id,
                     "❌ К сожалению, ваш запрос на доступ отклонен."
                 )
-            except:
-                pass
-            db.execute_query('DELETE FROM pending_users WHERE user_id = ?', (user_id,))
-            await callback.message.edit_text(f"❌ Запрос пользователя {user_id} отклонен") 
+                # Удаляем из списка ожидающих
+                db.execute_query('DELETE FROM pending_users WHERE user_id = ?', (user_id,))
+                # Обновляем сообщение
+                await callback.message.edit_text(f"❌ Запрос пользователя {user_id} отклонен")
+                await callback.answer("❌ Запрос отклонен", show_alert=True)
+                
+            except Exception as e:
+                print(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+                await callback.answer("❌ Ошибка отправки уведомления", show_alert=True)
+            
+    except Exception as e:
+        print(f"Ошибка при обработке действия: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)
 
 # Обработчик команды /admin
 @router.message(Command("admin"))
@@ -436,92 +507,43 @@ async def users_menu(message: types.Message):
         return
         
     # Получаем списки пользователей
-    allowed_users = db.execute_query('''
-        SELECT au.user_id, au.added_at, au.added_by 
-        FROM allowed_users au
-        ORDER BY au.added_at DESC
-    ''').fetchall()
+    pending_users = db.execute_query(
+        'SELECT user_id, username, full_name, request_time FROM pending_users'
+    ).fetchall()
     
-    # Получаем список ожидающих
-    pending_users = db.get_pending_users()
-    
-    text = "<b>👥 Управление пользователями</b>\n\n"
-    
-    # Список пользователей с доступом
-    if allowed_users:
-        text += "<b>✅ Пользователи с доступом:</b>\n"
-        for user in allowed_users:
-            user_id, added_at, added_by = user
-            text += f"• ID: {user_id} | Добавлен: {added_at[:16]}\n"
-    else:
-        text += "❌ Нет пользователей с доступом\n"
-    
+    text = "📊 Статистика пользователей:\n\n"
     keyboard = []
     
-    # Кнопки удаления для пользователей с доступом
-    for user in allowed_users:
-        user_id = user[0]
-        keyboard.append([
-            types.InlineKeyboardButton(
-                text=f"❌ Удалить {user_id}",
-                callback_data=f"remove_user:{user_id}"
-            )
-        ])
-    
-    # Список и кнопки для ожидающих доступ
     if pending_users:
-        text += "\n<b>⏳ Ожидают доступа:</b>\n"
-        for user in pending_users:
-            user_id, username, full_name, req_time = user
-            text += (
-                f"• ID: {user_id}\n"
-                f"  └ Имя: {full_name or 'не указано'}\n"
-                f"  └ @{username or 'нет username'}\n"
-                f"  └ Запрос: {req_time[:16]}\n"
-            )
-            # Добавляем кнопки одобрения/отклонения для каждого ожидающего
+        text += "👥 Ожидают доступа:\n"
+        for user_id, username, full_name, req_time in pending_users:
+            text += f"• ID: {user_id}\n"
+            text += f"Username: @{username}\n" if username and username != "Нет username" else "Username: не указан\n"
+            text += f"Имя: {full_name}\n" if full_name and full_name != "Нет имени" else "Имя: не указано\n"
+            text += f"Запрос: {req_time}\n\n"
+            
             keyboard.append([
-                types.InlineKeyboardButton(
-                    text=f"✅ Одобрить {user_id}",
-                    callback_data=f"approve_user:{user_id}"
+                InlineKeyboardButton(
+                    text="✅ Выдать доступ",
+                    callback_data=f"grant_{user_id}"
                 ),
-                types.InlineKeyboardButton(
-                    text=f"❌ Отклонить",
-                    callback_data=f"deny_user:{user_id}"
+                InlineKeyboardButton(
+                    text="❌ Отклонить",
+                    callback_data=f"deny_{user_id}"
                 )
             ])
-        
-        # Кнопки для массовых действий
-        keyboard.append([
-            types.InlineKeyboardButton(
-                text="✅ Одобрить всех",
-                callback_data="approve_all"
-            ),
-            types.InlineKeyboardButton(
-                text="❌ Отклонить всех",
-                callback_data="deny_all"
-            )
-        ])
     else:
-        text += "\n⏳ Нет ожидающих доступа"
-    
-    # Добавляем кнопку для добавления пользователя
-    keyboard.append([
-        types.InlineKeyboardButton(
-            text="➕ Добавить пользователя",
-            callback_data="add_user"
-        )
-    ])
+        text += "👥 Нет ожидающих доступа\n"
     
     keyboard.append([
-        types.InlineKeyboardButton(
+        InlineKeyboardButton(
             text="🔄 Обновить список",
-            callback_data="refresh_users"
+            callback_data="refresh_list"
         )
     ])
     
-    markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-    await message.answer(text, reply_markup=markup, parse_mode="HTML")
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await message.answer(text, reply_markup=markup)
 
 # Добавляем обработчики для одобрения/отклонения отдельных пользователей
 @router.callback_query(lambda c: c.data.startswith('approve_user:'))
@@ -589,9 +611,8 @@ async def deny_single_user(callback: CallbackQuery):
 async def refresh_users_list(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-    
-    await callback.answer("🔄 Список обновлен")
-    await users_menu(callback.message)
+    await list_access(callback.message)
+    await callback.answer("✅ Список обновлен")
 
 # Обработчик для одобрения/отклонения пользователей
 @router.callback_query(lambda c: c.data in ["approve_all", "deny_all"])
@@ -627,25 +648,28 @@ async def process_users(callback: CallbackQuery):
         )
     
     elif action == "deny_all":
-        # Получаем всех ожидающих пользователей
-        pending_users = db.execute_query('SELECT user_id FROM pending_users').fetchall()
-        
-        # Отправляем уведомления об отказе
-        for user in pending_users:
-            try:
-                await bot.send_message(
-                    user[0],
-                    "❌ К сожалению, ваш запрос на доступ к боту был отклонен."
-                )
-            except Exception as e:
-                print(f"Ошибка отправки сообщения пользователю {user[0]}: {e}")
-        
-        # Очищаем список ожидающих
-        db.execute_query('DELETE FROM pending_users')
-        
-        await callback.message.edit_text(
-            f"❌ Отклонено {len(pending_users)} запросов"
-        )
+        try:
+            # Получаем всех ожидающих пользователей
+            pending_users = db.execute_query('SELECT user_id FROM pending_users').fetchall()
+            
+            for (user_id,) in pending_users:
+                try:
+                    await callback.bot.send_message(
+                        user_id,
+                        "❌ К сожалению, ваш запрос на доступ отклонен."
+                    )
+                except Exception as e:
+                    print(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+            
+            # Очищаем список ожидающих
+            db.execute_query('DELETE FROM pending_users')
+            
+            await callback.message.edit_text("✅ Все запросы отклонены")
+            await callback.answer("✅ Все запросы отклонены", show_alert=True)
+            
+        except Exception as e:
+            print(f"Ошибка при отклонении всех запросов: {e}")
+            await callback.answer("❌ Произошла ошибка", show_alert=True)
 
 # Обработчик для выдачи доступа конкретному пользователю
 @router.message(Command("grant"))
@@ -721,121 +745,61 @@ async def remove_user_access(callback: CallbackQuery):
         await callback.answer("❌ Произошла ошибка при удалении") 
 
 @router.callback_query(lambda c: c.data == "add_user")
-async def add_user_prompt(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    
-    keyboard = [
-        [
-            types.InlineKeyboardButton(
-                text="❌ Отмена",
-                callback_data="cancel_add_user"
+async def add_user_start(callback: CallbackQuery):
+    await callback.message.answer("👤 Введите username пользователя\n❗️ Username должен начинаться с @\n\nНапример: @test_user")
+    await callback.message.edit_reply_markup(reply_markup=None)
+
+@router.message(lambda m: m.text and m.text.startswith('@') and is_admin(m.from_user.id))
+async def add_user_finish(message: Message):
+    try:
+        username = message.text[1:] if message.text.startswith('@') else message.text
+        
+        try:
+            # Используем прямой запрос к API Telegram
+            result = await message.bot(GetChat(chat_id=username))
+            user_id = result.id
+            
+            # Добавляем пользователя в список разрешенных
+            db.execute_query(
+                'INSERT OR REPLACE INTO allowed_users (user_id, username, full_name) VALUES (?, ?, ?)',
+                (user_id, username or "Нет username", "Нет имени")
             )
-        ]
-    ]
-    markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-    
-    await callback.message.answer(
-        "👤 Введите username пользователя\n"
-        "❗️ Username должен начинаться с @\n\n"
-        "<i>Например: @test_user</i>",
-        reply_markup=markup,
-        parse_mode="HTML"
-    )
-    await state.set_state(AdminStates.waiting_for_username)
-    await callback.answer()
-
-@router.message(AdminStates.waiting_for_username)
-async def process_username(message: Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
-        await state.clear()
-        return
-    
-    username = message.text.strip()
-    
-    if not username.startswith('@'):
-        await message.answer(
-            "❌ Username должен начинаться с @\n"
-            "Попробуйте еще раз или нажмите кнопку отмены"
-        )
-        return
-    
-    try:
-        # Создаем клавиатуру для подтверждения
-        keyboard = [
-            [
-                types.InlineKeyboardButton(
-                    text="✅ Подтвердить",
-                    callback_data=f"confirm_add:{username}"
-                ),
-                types.InlineKeyboardButton(
-                    text="❌ Отмена",
-                    callback_data="cancel_add_user"
+            db.conn.commit()
+            
+            # Отправляем уведомление пользователю
+            try:
+                await message.bot.send_message(
+                    user_id,
+                    "✅ Администратор выдал вам доступ к боту!\n"
+                    "Теперь вы можете пользоваться всеми функциями."
                 )
-            ]
-        ]
-        markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-        
-        await message.answer(
-            f"📝 Добавить пользователя {username}?",
-            reply_markup=markup
-        )
-        
-    except Exception as e:
-        await message.answer(f"❌ Произошла ошибка: {e}")
-        await state.clear()
-
-@router.callback_query(lambda c: c.data.startswith('confirm_add:'))
-async def confirm_add_user(callback: CallbackQuery, state: FSMContext):
-    if not is_admin(callback.from_user.id):
-        return
-    
-    username = callback.data.split(':')[1]
-    
-    try:
-        # Добавляем username в список разрешенных
-        if db.add_allowed_username(username):
-            # Получаем информацию о пользователе из списка ожидающих
-            pending_users = db.get_pending_users()
-            user_id = None
+                print(f"✅ Уведомление отправлено пользователю {user_id}")
+            except Exception as e:
+                print(f"❌ Ошибка отправки уведомления пользователю {user_id}: {e}")
             
-            # Ищем пользователя по username среди ожидающих
-            for pending_user in pending_users:
-                if f"@{pending_user[1]}" == username:  # pending_user[1] - это username
-                    user_id = pending_user[0]  # pending_user[0] - это user_id
-                    break
-            
-            if user_id:
-                try:
-                    # Отправляем уведомление пользователю
-                    await callback.bot.send_message(
-                        user_id,
-                        "✅ Администратор одобрил ваш запрос!\n"
-                        "Теперь вы можете пользоваться ботом."
-                    )
-                except Exception as e:
-                    print(f"Не удалось отправить уведомление пользователю: {e}")
-            
-            await callback.message.edit_text(
-                f"✅ Username {username} добавлен в список разрешенных!\n"
+            await message.answer(
+                f"✅ Пользователь {username} добавлен в список разрешенных!\n"
                 "Пользователь получит доступ при следующем обращении к боту."
             )
             
-            await users_menu(callback.message)
-        else:
-            await callback.message.edit_text("❌ Ошибка при добавлении пользователя")
-    
+        except Exception as e:
+            await message.answer(
+                f"❌ Ошибка: не удалось найти пользователя {username}\n"
+                "Убедитесь, что:\n"
+                "1. Пользователь существует\n"
+                "2. Username указан правильно (с @)\n"
+                "3. Пользователь должен начать диалог с ботом"
+            )
+            print(f"Ошибка поиска пользователя: {e}")
+            
     except Exception as e:
-        await callback.message.edit_text(f"❌ Произошла ошибка: {e}")
-    
-    finally:
-        await state.clear()
+        await message.answer("❌ Произошла ошибка при добавлении пользователя")
+        print(f"Ошибка добавления пользователя: {e}")
 
-@router.callback_query(lambda c: c.data == "cancel_add_user")
-async def cancel_add_user(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await callback.message.edit_text("❌ Добавление пользователя отменено")
-    await callback.answer() 
+# Добавляем кнопку отмены
+@router.message(lambda m: m.text == "❌ Отмена" and is_admin(m.from_user.id))
+async def cancel_add_user(message: Message):
+    await message.answer("❌ Добавление пользователя отменено")
 
 # Добавляем обработчик для кнопки открытия панели пользователей
 @router.callback_query(lambda c: c.data == "open_users_panel")
@@ -847,27 +811,230 @@ async def open_users_panel(callback: CallbackQuery):
     await callback.answer() 
 
 @router.callback_query(lambda c: c.data.startswith('grant_'))
-async def process_grant_access(callback: CallbackQuery):
+async def grant_access(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
     
     try:
         user_id = int(callback.data.split('_')[1])
         
-        if db.add_allowed_user(user_id, callback.from_user.id):
+        # Получаем информацию о пользователе через Telegram API
+        chat_member = await callback.bot.get_chat_member(user_id, user_id)
+        username = chat_member.user.username  # Получаем актуальный username
+        full_name = chat_member.user.full_name
+        
+        # Добавляем пользователя в список разрешенных с актуальным username
+        if db.add_allowed_user(user_id, username, full_name):
+            try:
+                # Отправляем уведомление пользователю
+                await callback.bot.send_message(
+                    user_id,
+                    "✅ Администратор одобрил ваш доступ к боту!\n"
+                    "Теперь вы можете пользоваться всеми функциями."
+                )
+                
+                # Удаляем из списка ожидающих
+                db.execute_query('DELETE FROM pending_users WHERE user_id = ?', (user_id,))
+                
+                # Обновляем список
+                await list_access(callback.message)
+                await callback.answer("✅ Доступ успешно выдан", show_alert=True)
+                
+            except Exception as e:
+                print(f"Ошибка отправки уведомления: {e}")
+                await callback.answer("❌ Ошибка отправки уведомления", show_alert=True)
+        else:
+            await callback.answer("❌ Ошибка при выдаче доступа", show_alert=True)
+            
+    except Exception as e:
+        print(f"Ошибка при выдаче доступа: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)
+
+@router.callback_query(lambda c: c.data == "deny_all")
+async def deny_all_users(callback: CallbackQuery):
+    try:
+        # Получаем всех ожидающих пользователей
+        pending_users = db.execute_query('SELECT user_id FROM pending_users').fetchall()
+        
+        for (user_id,) in pending_users:
             try:
                 await callback.bot.send_message(
                     user_id,
-                    "✅ Администратор одобрил ваш запрос!\n"
-                    "Теперь вы можете пользоваться ботом."
+                    "❌ К сожалению, ваш запрос на доступ отклонен."
+                )
+            except Exception as e:
+                print(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
+        
+        # Очищаем список ожидающих
+        db.execute_query('DELETE FROM pending_users')
+        
+        await callback.message.edit_text("✅ Все запросы отклонены")
+        await callback.answer("✅ Все запросы отклонены", show_alert=True)
+        
+    except Exception as e:
+        print(f"Ошибка при отклонении всех запросов: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True) 
+
+@router.callback_query(lambda c: c.data.startswith('revoke_'))
+async def revoke_access(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    try:
+        user_id = int(callback.data.split('_')[1])
+        
+        # Удаляем пользователя из списка разрешенных
+        if db.remove_allowed_user(user_id):  # Используем метод из класса Database
+            try:
+                # Уведомляем пользователя
+                await callback.bot.send_message(
+                    user_id,
+                    "❌ Ваш доступ к боту был отозван администратором."
                 )
             except Exception as e:
                 print(f"Ошибка отправки уведомления пользователю {user_id}: {e}")
             
-            db.remove_pending_user(user_id)
-            await callback.message.edit_text(f"✅ Доступ выдан пользователю {user_id}")
+            await callback.message.edit_text(f"🚫 Доступ пользователя {user_id} отозван")
+            await callback.answer("✅ Доступ отозван", show_alert=True)
         else:
-            await callback.message.edit_text("❌ Ошибка при выдаче доступа")
+            await callback.answer("❌ Пользователь не найден или уже не имеет доступа", show_alert=True)
+        
+    except Exception as e:
+        print(f"Ошибка при отзыве доступа: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True) 
+
+@router.callback_query(lambda c: c.data == "refresh_pending")
+async def refresh_pending_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await show_pending_users(callback.message)
+    await callback.answer("Список обновлен")
+
+@router.callback_query(lambda c: c.data == "refresh_allowed")
+async def refresh_allowed_list(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    await show_allowed_users(callback.message)
+    await callback.answer("Список обновлен") 
+
+@router.callback_query(lambda c: c.data.startswith("approve_"))
+async def approve_user(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    
+    try:
+        user_id = int(callback.data.split("_")[1])
+        
+        # Получаем информацию о пользователе
+        user = await callback.bot.get_chat_member(user_id, user_id)
+        username = user.user.username
+        full_name = user.user.full_name
+        
+        # Добавляем пользователя с его реальным username
+        db.add_allowed_user(user_id, username, full_name)
+        
+        try:
+            # Отправляем уведомление пользователю
+            await callback.bot.send_message(
+                user_id,
+                "✅ Администратор одобрил ваш доступ к боту!\n"
+                "Теперь вы можете пользоваться всеми функциями."
+            )
+            
+            # Удаляем из списка ожидающих
+            db.execute_query('DELETE FROM pending_users WHERE user_id = ?', (user_id,))
+            db.conn.commit()
+            
+            # Обновляем список
+            await list_access(callback.message)
+            await callback.answer("✅ Доступ успешно выдан", show_alert=True)
+            
+        except Exception as e:
+            print(f"Ошибка отправки уведомления: {e}")
+            await callback.answer("❌ Ошибка отправки уведомления", show_alert=True)
             
     except Exception as e:
-        await callback.answer(f"❌ Произошла ошибка: {e}") 
+        print(f"Ошибка при выдаче доступа: {e}")
+        await callback.answer("❌ Произошла ошибка", show_alert=True)
+    finally:
+        # Закрываем соединение с базой данных
+        if hasattr(db, 'conn') and db.conn:
+            db.conn.close()
+
+class AssignTaskStates(StatesGroup):
+    waiting_for_user = State()
+    waiting_for_task_name = State()
+    waiting_for_description = State()
+
+@router.message(Command("assign_task"))
+async def start_assign_task(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+        
+    # Получаем список пользователей с доступом
+    users = db.execute_query('''
+        SELECT user_id, username, full_name
+        FROM allowed_users 
+        WHERE user_id NOT IN ({})
+    '''.format(','.join(map(str, ADMIN_IDS)))).fetchall()
+    
+    keyboard = []
+    for user_id, username, full_name in users:
+        user_text = f"@{username}" if username else f"{full_name}"
+        keyboard.append([
+            InlineKeyboardButton(
+                text=user_text,
+                callback_data=f"select_user_{user_id}"
+            )
+        ])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await message.answer("Выберите пользователя для назначения задания:", reply_markup=markup)
+    await state.set_state(AssignTaskStates.waiting_for_user)
+
+@router.callback_query(lambda c: c.data.startswith("select_user_"))
+async def process_selected_user(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+        
+    user_id = int(callback.data.split("_")[2])
+    await state.update_data(assigned_to=user_id)
+    
+    await callback.message.answer("Введите название задания:")
+    await state.set_state(AssignTaskStates.waiting_for_task_name)
+
+@router.message(AssignTaskStates.waiting_for_task_name)
+async def process_task_name(message: Message, state: FSMContext):
+    await state.update_data(task_name=message.text)
+    await message.answer("Введите описание задания:")
+    await state.set_state(AssignTaskStates.waiting_for_description)
+
+@router.message(AssignTaskStates.waiting_for_description)
+async def process_task_description(message: Message, state: FSMContext):
+    data = await state.get_data()
+    
+    task_id = db.assign_task(
+        admin_id=message.from_user.id,
+        user_id=data['assigned_to'],
+        task_name=data['task_name'],
+        description=message.text
+    )
+    
+    if task_id:
+        # Уведомляем пользователя
+        try:
+            await message.bot.send_message(
+                data['assigned_to'],
+                f"📝 Вам назначено новое задание!\n\n"
+                f"📌 {data['task_name']}\n"
+                f"📝 {message.text}"
+            )
+        except Exception as e:
+            print(f"Ошибка отправки уведомления: {e}")
+            
+        await message.answer("✅ Задание успешно назначено!")
+    else:
+        await message.answer("❌ Ошибка при назначении задания")
+    
+    await state.clear()
+

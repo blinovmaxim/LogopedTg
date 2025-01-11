@@ -1,68 +1,26 @@
-from aiogram import Router, F, types
-from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
-from config import CHANNEL_ID, ADMIN_IDS, CHANNEL_URL, ADMIN_USERNAME
-from database import Database
-from aiogram import Bot
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from config import ADMIN_IDS, CHANNEL_ID, CHANNEL_URL, ADMIN_USERNAME, EXERCISE_CATEGORIES
+from database import db
+import logging
 
 router = Router()
-db = Database()
-
-async def check_subscription(user_id: int, bot) -> bool:
-    """Проверка подписки на канал"""
-    try:
-        if not CHANNEL_ID:
-            print("CHANNEL_ID не установлен")
-            return False
-            
-        member = await bot.get_chat_member(
-            chat_id=CHANNEL_ID, 
-            user_id=user_id
-        )
-        return member.status in ['member', 'administrator', 'creator']
-        
-    except Exception as e:
-        print(f"Ошибка проверки подписки: {e}")
-        return False
-
-async def check_admin_approval(user_id: int, username: str = None, message: Message = None) -> bool:
-    """Проверка одобрения администратором"""
-    try:
-        # Проверяем по user_id
-        if db.is_user_allowed(user_id):
-            return True
-            
-        # Проверяем по username
-        if username and db.is_username_allowed(f"@{username}"):
-            # Если username разрешен, добавляем пользователя в allowed_users
-            if db.add_allowed_user(user_id, None):
-                # Удаляем username из списка разрешенных
-                db.execute_query(
-                    'DELETE FROM allowed_usernames WHERE username = ?',
-                    (f"@{username}",)
-                )
-                if message:
-                    await message.answer("✅ Доступ к боту предоставлен!")
-                return True
-                
-        return False
-    except Exception as e:
-        print(f"Ошибка проверки доступа: {e}")
-        return False
 
 async def access_middleware(message: Message, bot: Bot) -> bool:
-    """Проверяет, имеет ли пользователь доступ к боту"""
     user_id = message.from_user.id
-    username = message.from_user.username
     
-    # Админы всегда имеют доступ
-    if user_id in ADMIN_IDS:
+    # Проверяем доступ через базу данных (которая уже проверяет админов)
+    if db.is_user_allowed(user_id):
+        await show_exercises_menu(message)
         return True
-    
-    # Проверяем подписку на канал
+        
+    # Для остальных проверяем подписку на канал
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
-        if member.status in ['left', 'kicked', 'banned']:
+        is_subscribed = member.status not in ['left', 'kicked', 'banned']
+        
+        if not is_subscribed:
+            # Показываем кнопку подписки
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -81,20 +39,225 @@ async def access_middleware(message: Message, bot: Bot) -> bool:
             )
             
             await message.answer(
-                "❗️ Для использования бота необходимо:\n\n"
+                "❗️ Для доступа к упражнениям необходимо:\n\n"
                 f"1. Подписаться на канал: {CHANNEL_URL}\n"
-                "2. Нажать кнопку «Проверить подписку»\n"
-                "3. Дождаться одобрения администратора",
+                "2. После подписки нажмите кнопку проверки",
                 reply_markup=keyboard
             )
             return False
-    except Exception as e:
-        print(f"Ошибка проверки подписки: {e}")
+            
+        # Проверяем ожидание подтверждения
+        pending = db.execute_query(
+            'SELECT 1 FROM pending_users WHERE user_id = ?', 
+            (user_id,)
+        ).fetchone()
+        
+        if pending:
+            await message.answer(
+                "⏳ Ваша заявка на доступ находится на рассмотрении\n"
+                "Пожалуйста, ожидайте решения администратора"
+            )
+            return False
+            
+        # Если подписан, но нет доступа - показываем кнопку запроса
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📝 Запросить доступ",
+                        callback_data="request_access"
+                    )
+                ]
+            ]
+        )
+        
+        await message.answer(
+            "❗️ Для доступа к упражнениям необходимо получить разрешение администратора\n\n"
+            "Нажмите кнопку ниже, чтобы отправить запрос",
+            reply_markup=keyboard
+        )
         return False
+        
+    except Exception as e:
+        logging.error(f"Ошибка при проверке доступа: {e}")
+        await message.answer("❌ Произошла ошибка при проверке доступа")
+        return False
+
+@router.callback_query(lambda c: c.data == "check_subscription")
+async def check_subscription(callback: CallbackQuery):
+    user_id = callback.from_user.id
     
-    # Проверяем одобрение администратора
-    is_approved = await check_admin_approval(user_id, username, message)
-    if not is_approved:
+    try:
+        member = await callback.bot.get_chat_member(CHANNEL_ID, user_id)
+        is_subscribed = member.status not in ['left', 'kicked', 'banned']
+        
+        if is_subscribed:
+            # Если подписан - проверяем доступ
+            if db.is_user_allowed(user_id):
+                await show_exercises_menu(callback.message)
+                return
+                
+            # Если нет доступа - показываем кнопку запроса
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📝 Запросить доступ",
+                            callback_data="request_access"
+                        )
+                    ]
+                ]
+            )
+            
+            await callback.message.edit_text(
+                "✅ Подписка подтверждена!\n\n"
+                "⏳ Теперь необходимо получить доступ у администратора\n"
+                "Нажмите кнопку ниже, чтобы отправить запрос",
+                reply_markup=keyboard
+            )
+        else:
+            await callback.answer(
+                "❌ Вы не подписаны на канал. Подпишитесь и попробуйте снова.",
+                show_alert=True
+            )
+            
+    except Exception as e:
+        print(f"Ошибка при проверке подписки: {e}")
+        await callback.answer(
+            "❌ Произошла ошибка при проверке подписки",
+            show_alert=True
+        )
+
+@router.message(lambda m: m.text == "🎯 Мои упражнения")
+async def show_exercises(message: Message):
+    user_id = message.from_user.id
+    
+    # Проверяем подписку на канал
+    try:
+        member = await message.bot.get_chat_member(CHANNEL_ID, user_id)
+        is_subscribed = member.status not in ['left', 'kicked', 'banned']
+        
+        if not is_subscribed:
+            # Если не подписан на канал
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📢 Подписаться на канал",
+                            url=CHANNEL_URL
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Проверить подписку",
+                            callback_data="check_subscription"
+                        )
+                    ]
+                ]
+            )
+            
+            await message.answer(
+                "❗️ Для доступа к упражнениям необходимо:\n\n"
+                f"1. Подписаться на канал: {CHANNEL_URL}\n"
+                "2. После подписки нажмите кнопку проверки",
+                reply_markup=keyboard
+            )
+            return
+            
+        # Проверяем наличие доступа
+        if not db.is_user_allowed(user_id):
+            # Проверяем, не отправлял ли уже запрос
+            pending = db.execute_query(
+                'SELECT 1 FROM pending_users WHERE user_id = ?', 
+                (user_id,)
+            ).fetchone()
+            
+            if pending:
+                await message.answer(
+                    "⏳ Ваша заявка на доступ находится на рассмотрении\n"
+                    "Пожалуйста, ожидайте решения администратора"
+                )
+                return
+                
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="📝 Запросить доступ",
+                            callback_data="request_access"
+                        )
+                    ]
+                ]
+            )
+            
+            await message.answer(
+                "❗️ Для доступа к упражнениям необходимо получить разрешение администратора\n\n"
+                "Нажмите кнопку ниже, чтобы отправить запрос",
+                reply_markup=keyboard
+            )
+            return
+            
+        # Если есть доступ - показываем упражнения
+        await show_exercises_menu(message)
+        
+    except Exception as e:
+        print(f"Ошибка при проверке доступа: {e}")
+        await message.answer("❌ Произошла ошибка при проверке доступа") 
+
+# Добавляем функцию для показа упражнений
+async def show_exercises_menu(message: Message):
+    keyboard = []
+    for code, name in EXERCISE_CATEGORIES.items():
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"➤ {name}",
+                callback_data=f"ex_{code}"
+            )
+        ])
+    
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    await message.answer(
+        "<b>🎯 Видео-упражнения</b>\n\n"
+        "<i>Выберите категорию упражнений:</i>\n\n"
+        "• Каждая категория содержит специально подобранные видео\n"
+        "• Выполняйте упражнения регулярно\n"
+        "• Следите за техникой выполнения",
+        reply_markup=markup,
+        parse_mode="HTML"
+    ) 
+
+@router.callback_query(lambda c: c.data == "request_access")
+async def process_access_request(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    username = callback.from_user.username
+    full_name = callback.from_user.full_name
+    
+    try:
+        # Проверяем, не отправлял ли уже запрос
+        pending = db.execute_query(
+            'SELECT 1 FROM pending_users WHERE user_id = ?', 
+            (user_id,)
+        ).fetchone()
+        
+        if pending:
+            await callback.answer(
+                "⏳ Ваша заявка уже находится на рассмотрении",
+                show_alert=True
+            )
+            return
+            
+        # Добавляем пользователя в список ожидающих
+        db.execute_query(
+            'INSERT INTO pending_users (user_id, username, full_name) VALUES (?, ?, ?)',
+            (user_id, username, full_name)
+        )
+        db.conn.commit()
+        
+        await callback.answer(
+            "✅ Заявка отправлена! Ожидайте решения администратора.",
+            show_alert=True
+        )
+        
         # Уведомляем админов
         for admin_id in ADMIN_IDS:
             try:
@@ -102,102 +265,27 @@ async def access_middleware(message: Message, bot: Bot) -> bool:
                     inline_keyboard=[
                         [
                             InlineKeyboardButton(
-                                text="✅ Выдать доступ",
-                                callback_data=f"grant_{user_id}"
+                                text="👁 Посмотреть заявку",
+                                callback_data=f"view_request_{user_id}"
                             )
                         ]
                     ]
                 )
                 
-                # Отправляем сообщение
-                await bot.send_message(
+                await callback.bot.send_message(
                     admin_id,
-                    f"👤 Новый пользователь ожидает подтверждения:\n"
-                    f"• Username: @{username or 'нет'}\n"
-                    f"• Имя: {message.from_user.full_name}\n"
-                    f"• ID: {user_id}",
+                    f"📝 Новая заявка на доступ!\n\n"
+                    f"От: {full_name}\n"
+                    f"Username: @{username or 'нет'}\n"
+                    f"ID: {user_id}",
                     reply_markup=keyboard
-                )
-                
-                # Отправляем всплывающее уведомление
-                await bot.send_message(
-                    admin_id,
-                    "❗️ Новый запрос на доступ",
-                    disable_notification=False  # Включаем уведомление
                 )
             except Exception as e:
                 print(f"Ошибка отправки уведомления админу {admin_id}: {e}")
-        
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="💬 Написать администратору",
-                        url=f"https://t.me/{ADMIN_USERNAME}"
-                    )
-                ]
-            ]
-        )
-        
-        await message.answer(
-            "✅ Вы подписаны на канал\n\n"
-            "⏳ Ожидайте одобрения администратора\n"
-            f"Для ускорения процесса напишите администратору: @{ADMIN_USERNAME}",
-            reply_markup=keyboard
-        )
-        return False
-    
-    return True
-
-@router.callback_query(F.data == "check_subscription")
-async def check_subscription_callback(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    is_subscribed = await check_subscription(user_id, callback.bot)
-    
-    if is_subscribed:
-        # Добавляем пользователя в список ожидающих
-        db.add_pending_user(
-            user_id=user_id,
-            username=callback.from_user.username,
-            full_name=callback.from_user.full_name
-        )
-        
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="💬 Написать администратору",
-                        url=f"https://t.me/{ADMIN_USERNAME}"
-                    )
-                ]
-            ]
-        )
-        
-        await callback.message.edit_text(
-            "✅ Подписка подтверждена!\n\n"
-            "⏳ Теперь необходимо получить доступ у администратора\n"
-            f"Напишите администратору: @{ADMIN_USERNAME}",
-            reply_markup=keyboard
-        )
-    else:
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(
-                        text="📢 Подписаться на канал",
-                        url=CHANNEL_URL
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="🔄 Проверить подписку",
-                        callback_data="check_subscription"
-                    )
-                ]
-            ]
-        )
-        
+                
+    except Exception as e:
+        print(f"Ошибка при обработке заявки: {e}")
         await callback.answer(
-            "❌ Вы не подписаны на канал. Подпишитесь и попробуйте снова.",
+            "❌ Произошла ошибка при отправке заявки",
             show_alert=True
         ) 

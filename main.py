@@ -2,8 +2,8 @@ import asyncio
 import logging
 from aiogram import Bot, Dispatcher, types
 from aiogram.fsm.storage.memory import MemoryStorage
-from config import BOT_TOKEN
-from handlers import admin, client, exercises, schedule, access
+from config import BOT_TOKEN, ADMIN_IDS
+from handlers import admin, client, exercises, schedule, access, tasks
 from aiogram.types import BotCommand
 from handlers.access import access_middleware
 import socket
@@ -12,6 +12,7 @@ import json
 from datetime import datetime
 import os
 import signal
+from database import Database
 
     # Инициализируем бота и диспетчер
 bot = Bot(token=BOT_TOKEN)
@@ -25,6 +26,7 @@ dp.include_router(admin.router)  # Сначала админский роуте�
 dp.include_router(client.router)
 dp.include_router(exercises.router)
 dp.include_router(schedule.router)
+dp.include_router(tasks.router)
 
 async def set_commands(bot: Bot):
     commands = [
@@ -87,8 +89,17 @@ def signal_handler(signum, frame):
 class AccessMiddleware:
     async def __call__(self, handler, event, data):
         if isinstance(event, types.Message):
-            if not await access_middleware(event, data['bot']):
-                return
+            # Проверяем, является ли команда из раздела упражнений
+            if event.text and event.text.startswith(('🎯 Упражнения', '/exercise')):
+                if not await access_middleware(event, data['bot']):
+                    return
+            # Для остальных команд пропускаем проверку
+        elif isinstance(event, types.CallbackQuery):
+            # Проверяем callback-запросы для упражнений
+            if event.data and event.data.startswith(('ex_', 'video:')):
+                if not await access_middleware(event.message, data['bot']):
+                    await event.answer("⚠️ Для доступа к упражнениям необходимо подписаться на канал и получить доступ", show_alert=True)
+                    return
         return await handler(event, data)
 
 # Регистрируем middleware
@@ -136,6 +147,13 @@ async def main():
         save_restart_status('success')
         
         await set_commands(bot)
+        
+        # Инициализация базы данных (только один раз)
+        db = Database()
+        
+        # Удаляем все обновления, которые произошли после последнего завершения работы бота
+        await bot.delete_webhook(drop_pending_updates=True)
+        
         await dp.start_polling(bot)
     except Exception as e:
         save_restart_status('error', str(e))

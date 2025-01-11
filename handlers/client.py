@@ -4,6 +4,7 @@ from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
 from keyboards.client_kb import get_main_keyboard
 from keyboards.admin_kb import get_admin_keyboard
 from config import ADMIN_IDS, EXERCISE_CATEGORIES
+from handlers.access import access_middleware
 
 router = Router()
 
@@ -34,11 +35,10 @@ async def cmd_help(message: Message):
         "/start - Начать работу с ботом\n"
         "/help - Показать это сообщение\n\n"
         "📌 Как пользоваться ботом:\n\n"
-        "1️⃣ Подпишитесь на канал @your_channel\n"
-        "2️⃣ Используйте кнопки меню для навигации\n"
-        "3️⃣ Для записи на прием нажмите '📝 Записаться на прием'\n"
-        "4️⃣ Чтобы посмотреть свои записи, нажмите '📅 Мои записи'\n"
-        "5️⃣ Для связи с логопедом используйте '💬 Связаться с логопедом'\n\n"
+        "1️⃣ Используйте кнопки меню для навигации\n"
+        "2️⃣ Для связи с логопедом используйте '💬 Связаться с логопедом'\n\n"
+        "3️⃣ Для записи на прием нажмите  '📝 Записаться на прием'\n\n"
+        "4️⃣ Чтобы посмотреть свои записи, нажмите '📅 Мои записи'\n\n"
         "❓ Остались вопросы? Нажмите 'Частые вопросы' или свяжитесь с администратором"
     )
     await message.answer(help_text)
@@ -47,20 +47,6 @@ async def cmd_help(message: Message):
 @router.message(F.text == "📝 Записаться на прием")
 async def make_appointment(message: Message):
     await message.answer("Выберите удобную дату и время для записи...")
-
-@router.message(F.text == "🎯 Мои упражнения")
-async def show_exercises(message: Message):
-    keyboard = []
-    for code, name in EXERCISE_CATEGORIES.items():
-        keyboard.append([
-            types.InlineKeyboardButton(
-                text=name,
-                callback_data=f"ex_{code}"
-            )
-        ])
-    
-    markup = types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-    await message.answer("Выберите категорию упражнений:", reply_markup=markup)
 
 @router.message(F.text == "📅 Мои записи")
 async def show_appointments(message: Message):

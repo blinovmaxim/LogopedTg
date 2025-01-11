@@ -1,18 +1,24 @@
 from aiogram import Router, F, types
 from aiogram.filters import Command
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.context import FSMContext
 from datetime import datetime
 from keyboards.client_kb import get_main_keyboard
 from states.exercise_states import ExerciseStates
 from config import EXERCISE_CATEGORIES, EXERCISE_SEARCH_QUERIES
 from utils.youtube import search_youtube_video
+from handlers.access import access_middleware
+
 
 router = Router()
 
 # Изменяем обработчик для кнопки "Мои упражнения"
 @router.message(F.text == "🎯 Мои упражнения")
 async def show_exercise_categories(message: Message):
+    # Проверяем доступ
+    if not await access_middleware(message, message.bot):
+        return
+        
     keyboard = []
     for code, name in EXERCISE_CATEGORIES.items():
         keyboard.append([
@@ -32,6 +38,15 @@ async def show_exercise_categories(message: Message):
         reply_markup=markup,
         parse_mode="HTML"
     )
+
+@router.callback_query(lambda c: c.data.startswith(('ex_', 'video:')))
+async def exercise_callback(callback: CallbackQuery):
+    # Проверяем доступ
+    if not await access_middleware(callback.message, callback.bot):
+        await callback.answer("⚠️ Для доступа к упражнениям необходимо подписаться на канал и получить одобрение", show_alert=True)
+        return
+        
+    # Остальной код обработки callback
 
 @router.callback_query(lambda c: c.data.startswith('ex_'))
 async def process_exercise_category(callback: CallbackQuery):

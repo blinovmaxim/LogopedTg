@@ -1,20 +1,20 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.utils.keyboard import ReplyKeyboardBuilder
 
-def get_admin_keyboard() -> ReplyKeyboardMarkup:
-    builder = ReplyKeyboardBuilder()
-    
+def get_admin_keyboard():
     buttons = [
-        "👥 Пользователи",
-        "📊 Статистика",
-        "🔄 Рестарт",
-        "ℹ️ Help",
-        "↩️ Назад"
+        [
+            KeyboardButton(text="👥 Ожидают доступ"),
+            KeyboardButton(text="✅ Пользователи с доступом")
+        ],
+        [
+            KeyboardButton(text="📊 Статистика"),
+            KeyboardButton(text="🔄 Рестарт")
+        ],
+        [
+            KeyboardButton(text="↩️ Назад")
+        ]
     ]
-    
-    for button in buttons:
-        builder.add(KeyboardButton(text=button))
-    
-    builder.adjust(2)  # По 2 кнопки в ряд
-    
-    return builder.as_markup(resize_keyboard=True) 
+    return ReplyKeyboardMarkup(
+        keyboard=buttons,
+        resize_keyboard=True
+    ) 
